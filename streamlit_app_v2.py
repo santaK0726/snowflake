@@ -2010,24 +2010,28 @@ with tab5:
             for i, ex in enumerate(examples):
                 with ex_cols[i]:
                     if st.button(ex, key=f"ex_{cat_name}_{i}", use_container_width=True):
-                        st.session_state["ai_q"] = ex
+                        st.session_state["ai_q_input"] = ex
+                        st.rerun()
 
         if "chat_history" not in st.session_state:
             st.session_state["chat_history"] = []
 
         user_q = st.text_input(
-            "질문 입력", value=st.session_state.get("ai_q", ""),
+            "질문 입력",
             placeholder="예: 2025년 초반 단계가 왜 약해졌어?",
-            key="ai_input",
+            key="ai_q_input",
         )
 
         col_send, col_clear = st.columns([1, 1])
+        with col_send:
+            send_clicked = st.button("질문하기", type="primary", use_container_width=True)
         with col_clear:
             if st.button("대화 초기화", use_container_width=True):
                 st.session_state["chat_history"] = []
-                st.session_state["ai_q"] = ""
+                st.session_state["ai_q_input"] = ""
+                st.rerun()
 
-        if user_q:
+        if send_clicked and user_q:
             history_text = ""
             if st.session_state["chat_history"]:
                 recent = st.session_state["chat_history"][-6:]
@@ -2044,7 +2048,8 @@ with tab5:
 
             st.session_state["chat_history"].append({"role": "user", "content": user_q})
             st.session_state["chat_history"].append({"role": "ai", "content": answer})
-            st.session_state["ai_q"] = ""
+            st.session_state["ai_q_input"] = ""
+            st.rerun()
 
         if st.session_state["chat_history"]:
             st.markdown("### 대화 내역")
