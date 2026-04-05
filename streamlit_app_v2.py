@@ -362,6 +362,17 @@ def load_freshness() -> pd.DataFrame:
     """)
 
 
+@st.cache_data(ttl=3600)
+def load_forecast() -> pd.DataFrame:
+    """Snowflake ML Forecast 결과 로드 — 테이블 미존재 시 빈 DataFrame 반환"""
+    return _safe_q(f"""
+        SELECT YEAR_MONTH, MAIN_CATEGORY_NAME,
+               FORECAST_COUNT, LOWER_BOUND, UPPER_BOUND
+        FROM {EXT_DB}.PUBLIC.CONTRACT_FORECAST_RESULTS
+        ORDER BY MAIN_CATEGORY_NAME, YEAR_MONTH
+    """)
+
+
 def cortex_available() -> bool:
     """Cortex 사용 가능 여부 — 낙관적 접근 (첫 호출 시 자동 감지, ping 제거)"""
     if "cortex_ok" in st.session_state:
@@ -376,7 +387,7 @@ def _escape_for_sql(text: str) -> str:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def cortex_chat(user_question: str, context: str) -> str:
+def cortex_chat(user_question: str, context: str, model: str = "mistral-large2") -> str:
     prompt = (
         "당신은 아정당(통신·렌탈 플랫폼) 운영 추천 대시보드의 AI 어시스턴트입니다.\n\n"
         "[필수 규칙]\n"
@@ -391,14 +402,14 @@ def cortex_chat(user_question: str, context: str) -> str:
     try:
         session = get_session()
         df = session.sql(
-            "SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', ?) AS R",
+            f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}', ?) AS R",
             params=[prompt],
         ).to_pandas()
         st.session_state["cortex_ok"] = True
         return str(df.iloc[0]["R"]).strip() if not df.empty else "답변을 생성하지 못했습니다."
     except Exception:
         try:
-            df = q(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2','{safe}') AS R")
+            df = q(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}','{safe}') AS R")
             st.session_state["cortex_ok"] = True
             return str(df.iloc[0]["R"]).strip() if not df.empty else "답변을 생성하지 못했습니다."
         except Exception as e:
@@ -407,20 +418,20 @@ def cortex_chat(user_question: str, context: str) -> str:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cortex_summarize(text: str) -> str:
+def cortex_summarize(text: str, model: str = "mistral-large2") -> str:
     prompt = text[:6000]
     safe = _escape_for_sql(prompt)
     try:
         session = get_session()
         df = session.sql(
-            "SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2', ?) AS R",
+            f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}', ?) AS R",
             params=[prompt],
         ).to_pandas()
         st.session_state["cortex_ok"] = True
         return str(df.iloc[0]["R"]).strip() if not df.empty else ""
     except Exception:
         try:
-            df = q(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('mistral-large2','{safe}') AS R")
+            df = q(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}','{safe}') AS R")
             st.session_state["cortex_ok"] = True
             return str(df.iloc[0]["R"]).strip() if not df.empty else ""
         except Exception:
@@ -702,15 +713,75 @@ STRATEGY_PROMPT_TEMPLATE = """당신은 통신·렌탈 플랫폼 '아정당'의 
 {data_facts}"""
 
 
+def detect_anomalies(v01_monthly: pd.DataFrame, v01_reg: pd.DataFrame,
+                     v06_product: pd.DataFrame, v04_channel: pd.DataFrame) -> str:
+    """[AI 에이전트 Step 1] 데이터를 자동 스캔하여 이상 징후를 감지"""
+    alerts = []
+
+    # 1) 월별 완료율 급변 감지 (직전월 대비 ±2%p 이상)
+    if not v01_monthly.empty:
+        monthly = v01_monthly.copy()
+        monthly["YEAR_MONTH"] = pd.to_datetime(monthly["YEAR_MONTH"])
+        for cat in ["인터넷", "렌탈"]:
+            cat_data = monthly[monthly["MAIN_CATEGORY_NAME"] == cat].sort_values("YEAR_MONTH")
+            if len(cat_data) >= 2:
+                cat_data["RATE_PCT"] = (cat_data["PAYEND_COUNT"] / cat_data["CONTRACT_COUNT"].replace(0, pd.NA) * 100).round(2)
+                cat_data["RATE_CHANGE"] = cat_data["RATE_PCT"].diff()
+                spikes = cat_data[cat_data["RATE_CHANGE"].abs() >= 2].tail(3)
+                for _, r in spikes.iterrows():
+                    direction = "급등" if r["RATE_CHANGE"] > 0 else "급락"
+                    alerts.append(
+                        f"[완료율 {direction}] {cat} {r['YEAR_MONTH'].strftime('%Y-%m')}: "
+                        f"완료율 {r['RATE_PCT']:.1f}% (전월 대비 {r['RATE_CHANGE']:+.1f}%p)"
+                    )
+
+    # 2) 지역별 이상치 — 전국 평균 대비 완료율 10%p 이상 하회
+    if not v01_reg.empty:
+        for cat in ["인터넷", "렌탈"]:
+            cat_reg = v01_reg[v01_reg["MAIN_CATEGORY_NAME"] == cat]
+            if not cat_reg.empty:
+                avg_rate = cat_reg["PAYEND_RATE_PCT"].mean()
+                outliers = cat_reg[cat_reg["PAYEND_RATE_PCT"] < avg_rate - 10]
+                for _, r in outliers.iterrows():
+                    alerts.append(
+                        f"[지역 이상치] {r['REGION']} {cat}: 완료율 {r['PAYEND_RATE_PCT']:.1f}% "
+                        f"(전국 평균 {avg_rate:.1f}% 대비 {r['PAYEND_RATE_PCT'] - avg_rate:+.1f}%p)"
+                    )
+
+    # 3) 렌탈 상품 — 완료율 60% 미만 상품
+    if not v06_product.empty:
+        low_products = v06_product[v06_product["PAYEND_RATE_PCT"] < 60]
+        for _, r in low_products.iterrows():
+            alerts.append(
+                f"[상품 경고] {r['RENTAL_SUB_CATEGORY']}: 완료율 {r['PAYEND_RATE_PCT']:.1f}%, "
+                f"손실 {fmt_int(r['LOSS_COUNT'])}건 (계약 {fmt_int(r['CONTRACT_COUNT'])}건)"
+            )
+
+    # 4) 채널 — 완료율 65% 미만 주요 채널
+    if not v04_channel.empty:
+        low_ch = v04_channel[(v04_channel["PAYEND_RATE_PCT"] < 65) & (v04_channel["CONTRACT_COUNT"] >= 200)]
+        for _, r in low_ch.head(3).iterrows():
+            alerts.append(
+                f"[채널 경고] {r['MAIN_CATEGORY_NAME']} {r['RECEIVE_PATH_NAME']}/{r['INFLOW_PATH_NAME']}: "
+                f"완료율 {r['PAYEND_RATE_PCT']:.1f}%, 계약 {fmt_int(r['CONTRACT_COUNT'])}건"
+            )
+
+    if not alerts:
+        return "이상 징후가 감지되지 않았습니다."
+
+    header = f"=== AI 에이전트 Step 1: 이상 징후 자동 감지 ({len(alerts)}건) ===\n"
+    return header + "\n".join(alerts)
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def cortex_generate_strategies(data_facts: str, strategy_context: str, trend_context: str) -> str:
+def cortex_generate_strategies(data_facts: str, strategy_context: str, trend_context: str, model: str = "mistral-large2") -> str:
     """Cortex AI가 추세 데이터를 포함하여 전략을 생성"""
     prompt = STRATEGY_PROMPT_TEMPLATE.format(
         data_facts=data_facts,
         strategy_context=strategy_context,
         trend_context=trend_context,
     )
-    return cortex_summarize(prompt)
+    return cortex_summarize(prompt, model=model)
 
 
 def parse_ai_strategies(ai_text: str) -> list[dict]:
@@ -838,6 +909,15 @@ from datetime import date as _date
 with st.sidebar:
     st.header("필터 & 설정")
 
+    # AI 모델 선택
+    CORTEX_MODEL = st.selectbox(
+        "🤖 AI 모델",
+        ["mistral-large2", "llama3.1-70b", "snowflake-arctic"],
+        index=0,
+        key="cortex_model",
+        help="Cortex AI 분석에 사용할 모델을 선택합니다. 모델에 따라 응답 품질과 속도가 달라집니다.",
+    )
+
     # 기준일 선택 — "오늘이 이 날이라면?" 시나리오
     dashboard_date = st.date_input(
         "📅 오늘 날짜 (기준일)",
@@ -857,7 +937,7 @@ with st.sidebar:
         for k in list(st.session_state.keys()):
             if k.startswith(("data_facts_", "trend_ctx_", "strategies_",
                              "tab1_ai_", "diag1_ai_", "diag2_ai_", "diag3_ai_",
-                             "classify_ai_", "sc_ai_")):
+                             "classify_ai_", "sc_ai_", "anomalies_")):
                 del st.session_state[k]
     st.session_state["_prev_dashboard_date"] = DASHBOARD_DATE
 
@@ -867,7 +947,7 @@ with st.sidebar:
         for k in list(st.session_state.keys()):
             if k.startswith(("data_facts_", "trend_ctx_", "strategies_", "cortex_ok",
                              "tab1_ai_", "diag1_ai_", "diag2_ai_", "diag3_ai_",
-                             "classify_ai_", "sc_ai_")):
+                             "classify_ai_", "sc_ai_", "anomalies_")):
                 del st.session_state[k]
         st.rerun()
 
@@ -887,6 +967,7 @@ with st.spinner("Snowflake에서 데이터를 불러오는 중..."):
     ext_news = load_external_news()
     weather_df = load_weather(DASHBOARD_DATE)
     holiday_df = load_holidays(DASHBOARD_DATE)
+    forecast_df = load_forecast()
 
     # [1층] 데이터 팩트 — session_state에 캐시 (DataFrame 해싱 회피)
     _facts_key = f"data_facts_{DASHBOARD_DATE}"
@@ -946,16 +1027,26 @@ with st.sidebar:
     sel_regions = st.multiselect("지역 필터", all_regions, default=all_regions, key="region_filter")
 
     st.markdown("---")
-    st.markdown("##### Snowflake 기술 활용")
+    st.markdown("##### Snowflake 기술 스택")
     techs = [
-        ("Snowpark", True, "데이터 처리"),
-        ("Streamlit", True, "대시보드 UI"),
-        ("Cortex AI", cortex_ready, "전략·진단·시나리오 전체"),
-        ("Marketplace 데이터", True, "아정당 데이터"),
-        ("Snowflake Forecast", True, "수요 예측"),
+        ("Snowpark", True, "SQL 11개 뷰 + 파라미터 바인딩"),
+        ("Streamlit in Snowflake", True, "5탭 대시보드 UI"),
+        ("Cortex AI", cortex_ready, f"{CORTEX_MODEL} — 전략·진단·시나리오·Q&A"),
+        ("AI 에이전트", True, "2단계 자율 분석 (이상 징후→전략)"),
+        ("Marketplace 데이터", True, "아정당 V01~V11 (6개 뷰)"),
+        ("외부 신호 통합", True, "날씨·공휴일·뉴스 3종"),
     ]
     for name, ok, detail in techs:
         st.markdown(f"{'✅' if ok else '⬜'} **{name}** <small style='color:#888;'>({detail})</small>", unsafe_allow_html=True)
+
+    # 비용 효율 표시
+    st.markdown("---")
+    st.markdown("##### 비용 효율")
+    _cortex_calls = sum(1 for k in st.session_state if k.startswith(("tab1_ai_", "diag1_ai_", "diag2_ai_",
+        "diag3_ai_", "classify_ai_", "sc_ai_", "strategies_")) and st.session_state[k] is not None and st.session_state[k] != "")
+    st.caption(f"이번 세션 AI 호출: {_cortex_calls}회")
+    st.caption("SQL 캐싱: @st.cache_data (동일 세션 내 재쿼리 0건)")
+    st.caption("AI 캐싱: session_state (탭 전환 시 재호출 0건)")
 
     st.markdown("---")
     st.markdown("##### 데이터 최신성")
@@ -968,11 +1059,11 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # 헤더
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("아정당 운영 추천 대시보드")
+st.title("아정당 AI 운영 전략 시스템")
 st.caption(
     f"오늘: **{DASHBOARD_DATE_LABEL}** | "
-    "내부 계약 데이터(V01~V11)와 외부 신호(날씨·공휴일·뉴스)를 종합하여 전략을 도출합니다. "
-    "사이드바에서 날짜를 변경하면 해당 시점의 전략이 달라집니다."
+    "내부 계약 × 외부 신호 × AI 추세 분석 → **자동 전략 도출**. "
+    "데이터가 바뀌면 전략도 바뀌는 실시간 의사결정 시스템입니다."
 )
 
 # ── 기간 선택 + 핵심 현황 분석 ──
@@ -1222,6 +1313,45 @@ with tab1:
         )
         st.altair_chart(loss_chart, use_container_width=True)
 
+    # ── Snowflake ML Forecast: 향후 계약 건수 예측 ──
+    if not forecast_df.empty:
+        st.markdown("### Snowflake ML Forecast: 향후 계약 건수 예측")
+        # 실제 월별 데이터 + 예측 데이터를 합쳐서 차트
+        actual_monthly = v01_monthly.groupby(["YEAR_MONTH", "MAIN_CATEGORY_NAME"], as_index=False).agg(
+            CONTRACT_COUNT=("CONTRACT_COUNT", "sum")
+        )
+        actual_monthly["TYPE"] = "실제"
+        actual_monthly = actual_monthly.rename(columns={"CONTRACT_COUNT": "COUNT"})
+
+        fc = forecast_df.copy()
+        fc["YEAR_MONTH"] = pd.to_datetime(fc["YEAR_MONTH"])
+        fc["TYPE"] = "예측"
+        fc = fc.rename(columns={"FORECAST_COUNT": "COUNT"})
+
+        combined = pd.concat([
+            actual_monthly[["YEAR_MONTH", "MAIN_CATEGORY_NAME", "COUNT", "TYPE"]].tail(12),
+            fc[["YEAR_MONTH", "MAIN_CATEGORY_NAME", "COUNT", "TYPE"]],
+        ], ignore_index=True)
+
+        forecast_chart = (
+            alt.Chart(combined)
+            .mark_line(point=True, strokeWidth=2)
+            .encode(
+                x=alt.X("YEAR_MONTH:T", title="월"),
+                y=alt.Y("COUNT:Q", title="계약 건수"),
+                color=alt.Color("MAIN_CATEGORY_NAME:N", title="카테고리",
+                                scale=alt.Scale(domain=["인터넷", "렌탈"], range=["#0f766e", "#c2410c"])),
+                strokeDash=alt.StrokeDash("TYPE:N", title="구분",
+                                          scale=alt.Scale(domain=["실제", "예측"], range=[[0], [5, 3]])),
+                tooltip=["YEAR_MONTH:T", "MAIN_CATEGORY_NAME", "COUNT", "TYPE"],
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(forecast_chart, use_container_width=True)
+        st.caption("점선은 Snowflake ML Forecast 모델의 예측값입니다. 실선은 실제 데이터입니다.")
+    else:
+        st.info("Snowflake ML Forecast 모델이 아직 설정되지 않았습니다.")
+
     st.markdown("### 초반 단계 전환율 변화 (2024 vs 2025)")
     funnel_inet = v03_funnel[v03_funnel["MAIN_CATEGORY_NAME"].isin(["인터넷", "렌탈"])]
     if not funnel_inet.empty:
@@ -1275,7 +1405,7 @@ with tab1:
                     + tab1_ai_ctx + "\n\n" + data_facts_compact
                 )
                 with st.spinner("Cortex AI 분석 중..."):
-                    tab1_analysis = cortex_summarize(tab1_prompt)
+                    tab1_analysis = cortex_summarize(tab1_prompt, model=CORTEX_MODEL)
                 if tab1_analysis:
                     st.session_state[_tab1_ai_key] = tab1_analysis
                     st.rerun()
@@ -1357,7 +1487,7 @@ with tab2:
                             f"[전체 현황 참고]\n{strategy_context}"
                         )
                         with st.spinner("Cortex AI 분석 중..."):
-                            diag1_result = cortex_summarize(diag1_prompt)
+                            diag1_result = cortex_summarize(diag1_prompt, model=CORTEX_MODEL)
                         if diag1_result:
                             st.session_state[_diag1_key] = diag1_result
                             st.rerun()
@@ -1411,7 +1541,7 @@ with tab2:
                             f"[데이터]\n{top10_ctx}\n\n[전체 현황 참고]\n{strategy_context}"
                         )
                         with st.spinner("Cortex AI가 문제를 분류하고 있습니다..."):
-                            classify_result = cortex_summarize(classify_prompt)
+                            classify_result = cortex_summarize(classify_prompt, model=CORTEX_MODEL)
                         if classify_result:
                             st.session_state[_classify_key] = classify_result
                             st.rerun()
@@ -1444,7 +1574,7 @@ with tab2:
                             f"[데이터]\n{diag2_ctx}\n\n[전체 현황 참고]\n{strategy_context}"
                         )
                         with st.spinner("Cortex AI 분석 중..."):
-                            diag2_result = cortex_summarize(diag2_prompt)
+                            diag2_result = cortex_summarize(diag2_prompt, model=CORTEX_MODEL)
                         if diag2_result:
                             st.session_state[_diag2_key] = diag2_result
                             st.rerun()
@@ -1532,7 +1662,7 @@ with tab2:
                         + "\n".join(ch_ctx_parts) + f"\n\n[전체 현황 참고]\n{strategy_context}"
                     )
                     with st.spinner("Cortex AI 분석 중..."):
-                        diag3_result = cortex_summarize(diag3_prompt)
+                        diag3_result = cortex_summarize(diag3_prompt, model=CORTEX_MODEL)
                     if diag3_result:
                         st.session_state[_diag3_key] = diag3_result
                         st.rerun()
@@ -1553,15 +1683,48 @@ with tab3:
     )
 
     if cortex_ready:
+        # ── AI 에이전트 워크플로 시각화 ──
+        st.markdown("### AI 에이전트 분석 흐름")
+        agent_cols = st.columns(3)
+        with agent_cols[0]:
+            st.markdown(
+                '<div class="mini-card"><div class="mini-card-title">Step 1: 이상 징후 감지</div>'
+                '<div class="mini-card-note">전체 데이터를 자동 스캔하여<br/>완료율 급변, 지역 이상치,<br/>상품·채널 경고를 감지합니다.</div></div>',
+                unsafe_allow_html=True,
+            )
+        with agent_cols[1]:
+            st.markdown(
+                '<div class="mini-card"><div class="mini-card-title">Step 2: 전략 수립</div>'
+                '<div class="mini-card-note">이상 징후 + 추세 + 외부 신호를<br/>종합하여 5개 카테고리별<br/>우선순위 전략을 도출합니다.</div></div>',
+                unsafe_allow_html=True,
+            )
+        with agent_cols[2]:
+            st.markdown(
+                '<div class="mini-card"><div class="mini-card-title">Step 3: 근거 매칭</div>'
+                '<div class="mini-card-note">각 전략에 연관된 데이터를<br/>자동으로 매칭하여<br/>검증 가능한 근거를 제시합니다.</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # Step 1: 이상 징후 자동 감지 (Python 로직, Cortex 불필요 → 즉시 실행)
+        _anomaly_key = f"anomalies_{DASHBOARD_DATE}"
+        if _anomaly_key not in st.session_state:
+            st.session_state[_anomaly_key] = detect_anomalies(v01_monthly, v01_reg, v06_product, v04_channel)
+        anomaly_report = st.session_state[_anomaly_key]
+
+        with st.expander("🔍 Step 1 결과: 자동 감지된 이상 징후", expanded=False):
+            st.code(anomaly_report, language=None)
+
         # session_state에 캐시 — 탭 전환/rerun 시 재호출 방지 (기준일별로 별도 캐시)
         cache_key = f"strategies_{DASHBOARD_DATE}"
         if cache_key not in st.session_state:
             st.session_state[cache_key] = None
 
         if st.session_state[cache_key] is None:
-            if st.button("🤖 Cortex AI 전략 도출 시작", type="primary", use_container_width=True, key="gen_strat"):
-                with st.spinner("Cortex AI가 데이터를 분석하여 전략을 도출하고 있습니다..."):
-                    result = cortex_generate_strategies(data_facts, strategy_context, trend_context)
+            if st.button("🤖 Step 2: Cortex AI 전략 도출 시작", type="primary", use_container_width=True, key="gen_strat"):
+                # 이상 징후를 전략 프롬프트에 4번째 컨텍스트로 추가
+                enriched_facts = data_facts + "\n\n" + anomaly_report
+                with st.spinner("Cortex AI 에이전트가 데이터를 분석하여 전략을 도출하고 있습니다..."):
+                    result = cortex_generate_strategies(enriched_facts, strategy_context, trend_context, model=CORTEX_MODEL)
                 st.session_state[cache_key] = result if result else ""
                 st.rerun()
 
@@ -1946,7 +2109,7 @@ with tab4:
                         f"3) 리스크와 완화 방안 — 과거 유사 패턴이 있다면 인용\n"
                         f"[필수] 모든 제안에 현재 데이터 수치를 근거로 포함하세요."
                     )
-                    sc_analysis = cortex_summarize(scenario_prompt)
+                    sc_analysis = cortex_summarize(scenario_prompt, model=CORTEX_MODEL)
                 if sc_analysis:
                     st.session_state[_sc_key] = sc_analysis
                     st.rerun()
@@ -2069,7 +2232,7 @@ with tab5:
             full_context = context_text + history_text
 
             with st.spinner("Cortex AI가 답변을 생성하고 있습니다..."):
-                answer = cortex_chat(user_q, full_context)
+                answer = cortex_chat(user_q, full_context, model=CORTEX_MODEL)
 
             st.session_state["chat_history"].append({"role": "user", "content": user_q})
             st.session_state["chat_history"].append({"role": "ai", "content": answer})
@@ -2089,3 +2252,23 @@ with tab5:
                         f'<div class="chat-msg chat-ai"><b>A:</b> {msg["content"]}</div>',
                         unsafe_allow_html=True,
                     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 향후 전망 & 확장 가능성
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown(
+    """<div style="padding:20px;border-radius:16px;background:linear-gradient(135deg,#f0f4f8,#e8eef5);
+    border:1px solid #d5dde5;margin-top:20px;">
+    <div style="font-size:15px;font-weight:700;color:#133a5e;">향후 확장 로드맵</div>
+    <div style="margin-top:12px;font-size:13px;color:#3a5068;line-height:1.8;">
+    <b>Phase 1</b> Snowflake ML Forecast 연동 — 카테고리별 계약 건수 예측으로 선제적 전략 수립<br/>
+    <b>Phase 2</b> 유동인구×렌탈 수요 상관분석 — SPH 유동인구 데이터와 지역별 계약 패턴 교차 분석<br/>
+    <b>Phase 3</b> 부동산 이사 데이터 연동 — 리치고 부동산 거래 데이터로 인터넷 수요 예측 고도화<br/>
+    <b>Phase 4</b> 실시간 콜센터 스트리밍 — Snowpipe + Dynamic Tables로 실시간 전환율 모니터링<br/>
+    <b>Phase 5</b> 멀티 테넌트 확장 — Snowflake 데이터 공유로 타 통신·렌탈 사업자에게 SaaS 제공
+    </div>
+    </div>""",
+    unsafe_allow_html=True,
+)
