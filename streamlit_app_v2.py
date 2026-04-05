@@ -1527,9 +1527,9 @@ with tab2:
 with tab3:
     st.subheader(f"전략 추천: {DASHBOARD_DATE_LABEL} 기준, 무엇을 먼저 할 것인가")
     st.markdown(
-        '<div class="summary-box">한 줄 요약: Cortex AI가 <b>2025년 전체 실적</b>과 <b>전년 대비 추세</b>, '
-        '<b>외부 신호</b>를 종합 분석하여 최우선 전략을 도출합니다. '
-        '(상단 기간 선택과 무관하게 항상 최신 전체 데이터 기준)</div>',
+        f'<div class="summary-box">한 줄 요약: Cortex AI가 <b>{DASHBOARD_DATE_LABEL}</b> 기준, '
+        f'해당 시점까지의 <b>전체 실적·월별 추세·외부 신호</b>를 종합 분석하여 최우선 전략을 도출합니다. '
+        f'(사이드바에서 오늘 날짜를 변경하면 전략이 달라집니다)</div>',
         unsafe_allow_html=True,
     )
 
