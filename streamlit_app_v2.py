@@ -2004,13 +2004,17 @@ with tab5:
             ],
         }
 
+        # 예시 클릭 → _pending_q에 저장 (위젯 렌더링 전이므로 안전)
+        if "_pending_q" in st.session_state:
+            st.session_state["ai_q_input"] = st.session_state.pop("_pending_q")
+
         for cat_name, examples in ex_categories.items():
             st.markdown(f"**{cat_name}**")
             ex_cols = st.columns(len(examples))
             for i, ex in enumerate(examples):
                 with ex_cols[i]:
                     if st.button(ex, key=f"ex_{cat_name}_{i}", use_container_width=True):
-                        st.session_state["ai_q_input"] = ex
+                        st.session_state["_pending_q"] = ex
                         st.rerun()
 
         if "chat_history" not in st.session_state:
@@ -2028,7 +2032,7 @@ with tab5:
         with col_clear:
             if st.button("대화 초기화", use_container_width=True):
                 st.session_state["chat_history"] = []
-                st.session_state["ai_q_input"] = ""
+                st.session_state["_pending_q"] = ""
                 st.rerun()
 
         if send_clicked and user_q:
@@ -2048,7 +2052,7 @@ with tab5:
 
             st.session_state["chat_history"].append({"role": "user", "content": user_q})
             st.session_state["chat_history"].append({"role": "ai", "content": answer})
-            st.session_state["ai_q_input"] = ""
+            st.session_state["_pending_q"] = ""
             st.rerun()
 
         if st.session_state["chat_history"]:
