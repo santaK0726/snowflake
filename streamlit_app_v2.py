@@ -912,7 +912,7 @@ with st.sidebar:
     # AI 모델 선택
     CORTEX_MODEL = st.selectbox(
         "🤖 AI 모델",
-        ["claude-4-5-sonnet", "mistral-large2", "llama3.1-70b", "snowflake-arctic"],
+        ["claude-4-5-sonnet", "claude-opus-4", "gpt-5.4", "gpt-5.3", "mistral-large2", "llama3.1-70b", "snowflake-arctic"],
         index=0,
         key="cortex_model",
         help="Cortex AI 분석에 사용할 모델을 선택합니다. 모델에 따라 응답 품질과 속도가 달라집니다.",
